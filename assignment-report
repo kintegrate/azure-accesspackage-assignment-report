@@ -1,0 +1,358 @@
+$clientId = [System.Environment]::GetEnvironmentVariable("CLIENT_ID")
+$clientSecret = [System.Environment]::GetEnvironmentVariable("CLIENT_SECRET")
+$tenantId = [System.Environment]::GetEnvironmentVariable("TENANT")
+
+#functions
+function Get-GraphAccessToken {
+
+    if (-not $clientId) {
+        Write-Error "Service Principal Client ID is missing."
+        exit 1
+    }
+    if (-not $clientSecret) {
+        Write-Error "Service Principal Client Secret is missing."
+        exit 1
+    }
+    if (-not $tenantId) {
+        Write-Error "Service Principal Tenant ID is missing."
+        exit 1
+    }
+    
+    $headers = @{
+    "Content-Type" = "application/x-www-form-urlencoded"
+    }
+
+    $body = "grant_type=client_credentials&client_id=$clientId&client_secret=$clientSecret&scope=https%3A%2F%2Fgraph.microsoft.com%2F.default"
+    $authUri = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+    $response = Invoke-RestMethod $authUri  -Method 'POST' -Headers $headers -Body $body
+    $response | ConvertTo-Json
+ 
+    $token = $response.access_token | ConvertTo-SecureString -AsPlainText -Force
+    # Authenticate to the Microsoft Graph
+
+    try {
+        Connect-MgGraph -AccessToken $token -NoWelcome
+
+    }
+    catch { 
+        Write-Error "Failed to authenticate with Microsoft Graph. Error: $_"
+        throw $_ 
+    }
+}
+
+function Get-Username {
+    param($targetId)
+    
+    # Construct the URI for user information
+    $uriUser = "https://graph.microsoft.com/v1.0/users/$targetId"
+    
+    try {
+        $userInfo = Invoke-RestMethod -Method Get -Uri $uriUser -Headers $headers
+        return $userInfo.userPrincipalName  # Return the username (userPrincipalName)
+    }
+    catch {
+        Write-Error "Failed to retrieve user information for targetId $targetId. Error: $_"
+        return "Unknown"
+    }
+}
+
+function Get-ApName {
+    param($tempApId)
+
+    $uriAp = "https://graph.microsoft.com/beta/identityGovernance/entitlementManagement/accessPackages/$tempApId"
+    try {
+        $apInfo = Invoke-RestMethod -Method Get -Uri $uriAp -Headers $headers
+        return $apInfo.displayName
+    }
+    catch {
+        Write-Error "Failed to retrieve access package information for ID $tempApId. Error: $_"
+        return "Unknown"
+    }
+}
+
+#Convert token to JSON
+$token = Get-GraphAccessToken
+$token = $token | ConvertFrom-Json
+$token = $token.access_token
+
+$headers = @{
+    "Authorization" = "Bearer $token"
+    "Content-Type" = "application/json"
+}
+
+#retrieve catalog information
+$catalogName = Read-Host "Enter the catalog name: "
+
+try {
+    $uri1 = "https://graph.microsoft.com/beta/identityGovernance/entitlementManagement/accessPackageCatalogs?`$filter=contains(tolower(displayName),'$catalogName')"
+    $catalogInfo = Invoke-RestMethod -Method Get -Uri $uri1 -Headers $headers 
+}
+catch { 
+    Write-Error "Failed to retrieve catalog information. Error: $_"
+    throw $_ 
+}
+
+# Check if multiple catalogs are returned
+if ($catalogInfo.value.Count -gt 1) {
+    # Multiple catalogs found, list them with indices
+    Write-Host "Multiple catalogs found:"
+    for ($i = 0; $i -lt $catalogInfo.value.Count; $i++) {
+        Write-Host "$i. $($catalogInfo.value[$i].displayName) (ID: $($catalogInfo.value[$i].id))"
+    }
+
+    # Prompt the user to select one by index
+    $selectedIndex = Read-Host -Prompt "Enter the index number of the catalog you want to select"
+    
+    # Validate the selected index
+    if ($selectedIndex -ge 0 -and $selectedIndex -lt $catalogInfo.value.Count) {
+        $selectedCatalog = $catalogInfo.value[$selectedIndex]
+    } else {
+        Write-Error "Invalid selection."
+        exit
+    }
+} elseif ($catalogInfo.value.Count -eq 1) {
+    # Only one catalog found, select it
+    $selectedCatalog = $catalogInfo.value[0]
+} else {
+    Write-Host "No catalogs found with the specified name."
+    exit
+}
+
+$catalogName = $selectedCatalog.displayName
+$catalogId = $selectedCatalog.id
+
+
+Write-Host "Selected catalog with the name: " -NoNewline
+Write-Host $catalogName -ForegroundColor Cyan -NoNewline
+Write-Host ", and ID: " -NoNewline
+Write-Host $catalogId -ForegroundColor Cyan
+
+$uriPackages = "https://graph.microsoft.com/beta/identityGovernance/entitlementManagement/accessPackages"
+$allAccessPackages = @()
+
+try {
+    # Loop through pages to get all access packages
+    do {
+        # Retrieve the current page of access packages
+        $response = Invoke-RestMethod -Method Get -Uri $uriPackages -Headers $headers
+        $allAccessPackages += $response.value
+
+        # If there's another page, set the URI for the next page
+        $uriPackages = $response.'@odata.nextLink'
+    } while ($uriPackages)
+
+}
+catch {
+    Write-Error "Failed to retrieve access packages. Error: $_"
+    throw $_
+}
+
+$filteredPackages = $allAccessPackages | Where-Object { $_.catalogId -eq $catalogId }
+
+if ($filteredPackages.Count -eq 0) {
+    Write-Host "No access packages found for catalog ID: $catalogId"
+    #exit
+}
+
+Write-Host "Found " -NoNewline
+Write-Host $($filteredPackages.Count) -NoNewline -ForegroundColor Cyan
+Write-Host " access packages for catalog: " -NoNewline
+Write-Host $catalogName -ForegroundColor Cyan
+
+# List the access packages
+for ($i = 0; $i -lt $filteredPackages.Count; $i++) {
+    Write-Host "$i. " -NoNewline
+    Write-Host $($filteredPackages[$i].displayName) -ForegroundColor Cyan -NoNewline
+    Write-Host " ID: " -NoNewline
+    Write-Host $($filteredPackages[$i].id) -ForegroundColor Cyan
+}
+
+$selectionMode = Read-Host "Do you want to run the report for all access packages or select specific ones? (Type 'all' or 'select')"
+
+if ($selectionMode -eq 'select') {
+    # Prompt user to select specific access packages by their index
+    $selectedIndexes = Read-Host "Enter the index numbers of the access packages you want to include (comma-separated, e.g., 0,1,2,3)"
+
+    # Convert user input to an array of indexes
+    $selectedIndexes = $selectedIndexes -split ',' | ForEach-Object { $_.Trim() }
+
+    # Filter the selected access packages
+    $selectedPackages = $filteredPackages[$selectedIndexes]
+} else {
+    # If 'all' is selected, use all access packages
+    $selectedPackages = $filteredPackages
+}
+
+# Ensure $requestsData is initialized as an empty array
+$requestsData = @()
+
+# Loop through the selected access packages
+foreach ($package in $selectedPackages) {
+    $apId = $package.id  # Access Package ID
+
+    # Log which package is being processed
+    Write-Host "Processing access package: " -NoNewline -ForegroundColor Yellow
+    Write-Host  $($package.displayName) -NoNewline -ForegroundColor Cyan
+    Write-Host " (ID: " -NoNewline -ForegroundColor Yellow
+    Write-Host $apId -NoNewline -ForegroundColor Cyan
+    Write-Host ")" -ForegroundColor Yellow
+
+    $uriRequests = "https://graph.microsoft.com/beta/identityGovernance/entitlementManagement/assignmentRequests?`$expand=accessPackage,accessPackageAssignment&`$filter=accessPackage/Id eq '$apId'"
+    $allRequests = @()
+    try {
+        do {
+            $response = Invoke-RestMethod -Method Get -Uri $uriRequests -Headers $headers
+            $allRequests += $response.value
+        
+
+            # If there's another page, set the URI for the next page
+            $uriRequests = $response.'@odata.nextLink'
+        } while ($uriRequests)
+
+    } catch {
+        Write-Error "Failed to retrieve assignment requests for package $apId. Error: $_"
+    }
+
+    Write-Host "Total requests retrieved for package $($package.displayName): $($allRequests.Count)" -ForegroundColor Green
+
+    # Start processing the requests with a progress bar
+    $totalRequests = $allRequests.Count
+    $currentRequest = 0
+
+    foreach ($request in $allRequests) {
+        # Update the progress bar for this package
+        $percentComplete = [math]::Round(($currentRequest / $totalRequests) * 100)
+        Write-Progress -Activity "Processing requests for $($package.displayName)" -Status "$currentRequest of $totalRequests completed" -PercentComplete $percentComplete
+
+        # Construct the data object as before
+        $data = [PSCustomObject]@{
+            RequestId = if ($request.id) { $request.id } else { "Unknown" }
+            RequestType = if ($request.requestType) { $request.requestType } else { "Unknown" }
+            RequestDateTime = if ($request.createdDateTime) { $request.createdDateTime } else { "Unknown" }
+            AccessPackageName = if ($request.accessPackage.displayName) { $request.accessPackage.displayName } else { "Unknown" }
+            AccessPackageId = if ($request.accessPackage.id) { $request.accessPackage.id } else { "Unknown" }
+            RequestorName = Get-Username -targetId $request.accessPackageAssignment.targetId
+            RequestorId = if ($request.accessPackageAssignment.targetId) { $request.accessPackageAssignment.targetId } else { "Unknown" }
+            Justification = if ($request.justification) { $request.justification } else { "None" }
+            Answers = if ($request.answers.value -ne $null) { $request.answers.value } else { "N/A" }
+            Schedule = if ($request.schedule.startDateTime) { $request.schedule.startDateTime } else { "N/A" }
+            # StartDateTime = if ($request.requestType -eq 'AdminAdd') { $request.schedule.startDateTime } else { "N/A" }
+        }
+
+        # Add the data object to the assignmentData array
+        $requestsData += $data
+
+        # Increment the current request count for the progress bar
+        $currentRequest++
+    }
+
+    # Clear progress after each package
+    Write-Progress -Activity "Processing complete for package $($package.displayName)" -Status "All requests processed" -Completed
+}
+
+# After processing all the selected packages, export the data if it exists
+if ($requestsData.Count -eq 0) {
+    Write-Host "No requests data to export."
+    return
+}
+
+#Get all assignments for the access packages
+$assignmentsData = @()
+
+foreach ($package in $selectedPackages){
+    $apId = $package.id
+    
+    Write-Host "Processing access package: " -NoNewline -ForegroundColor Yellow
+    Write-Host  $($package.displayName) -NoNewline -ForegroundColor Cyan
+    Write-Host " (ID: " -NoNewline -ForegroundColor Yellow
+    Write-Host $apId -NoNewline -ForegroundColor Cyan
+    Write-Host ")" -ForegroundColor Yellow
+    
+    $uriAssignments = "https://graph.microsoft.com/beta/identityGovernance/entitlementManagement/accessPackageAssignments?`$filter=accessPackageId eq '$apId'"
+    $allAssignments = @()
+    try{
+        do{
+            $response1 = Invoke-RestMethod -Method Get -Uri $uriAssignments -Headers $headers
+            $allAssignments += $response1.value
+
+            $uriAssignments = $response1.'@odata.nextLink'
+        } while ($uriAssignments)
+    } catch {
+        Write-Error "Failed to retrieve assignments for package $apId. Error: $_"
+    }
+    
+    $totalAssignments = $allAssignments.Count
+    $currentAssignment = 0
+    
+    Write-Host "Total assignments retrieved for package $($package.displayName): $totalAssignments" -ForegroundColor Green
+    
+    foreach ($assignment in $allAssignments){
+
+        $percentComplete1 = [math]::Round(($currentRequest / $totalRequests) * 100)
+        Write-Progress -Activity "Processing assignments for $($package.displayName)" -Status "$currentAssignment of $totalAssignments completed" -PercentComplete $percentComplete1
+        $tempApId = $assignment.accessPackageId
+        $adata = [PSCustomObject]@{
+            AssignmentId = if ($assignment.id) { $assignment.id } else { "Unknown" }
+            AssignmentState = if ($assignment.assignmentState) { $assignment.assignmentState } else { "Unknown" }
+            AccessPackageId = if ($assignment.accessPackageId) { $assignment.accessPackageId } else { "Unknown" }
+            AccessPackageName = Get-ApName -tempApId $tempApId
+            AssignmentPolicyId = if ($assignment.assignmentPolicyId) { $assignment.assignmentPolicyId } else { "Unknown" }
+            UserName = if ($assignment.targetId) { Get-Username -targetId $assignment.targetId } else { "Unknown" }
+            UserId = if ($assignment.targetId) { $assignment.targetId } else { "Unknown" }
+            AssignmentStart = if ($assignment.schedule.startDateTime) { $assignment.schedule.startDateTime } else { "Unknown" }
+            AssignmentEnd = if ($assignment.schedule.expiration.endDateTime) { $assignment.schedule.expiration.endDateTime } else { "Unknown" }
+        }
+        $assignmentsData += $adata
+
+        $currentAssignment++
+    }
+    Write-Progress -Activity "Processing complete for package $($package.displayName)" -Status "All assignments processed" -Completed
+}
+if ($assignmentsData.Count -eq 0) {
+    Write-Host "No assignment data to export."
+    return
+}
+
+$mergedData = @()
+
+foreach ($request in $requestsData) {
+    # Extract relevant fields
+    $username = $request.RequestorName
+    $requestDate = [datetime]$request.RequestDateTime
+
+    # Find matching assignments based on username and date range
+    $matchingAssignments = $assignmentsData | Where-Object {
+        $_.UserName -eq $username -and $_.AccessPackageId -eq $request.AccessPackageId -and
+        ([datetime]$_.AssignmentStart).Date -eq $requestDate.Date -and
+        [datetime]$_.AssignmentStart -ge $requestDate -and
+        (
+            [string]$_.AssignmentEnd -eq '' -or
+            [datetime]$_.AssignmentEnd -ge $requestDate
+        )
+    }
+
+    # Combine the request and matching assignments
+    foreach ($assignment in $matchingAssignments) {
+        # Create a merged object that combines both request and assignment data
+        $mergedItem = [PSCustomObject]@{
+            RequestId          = $request.RequestId
+            RequestType        = $request.RequestType
+            RequestDateTime    = $request.RequestDateTime
+            AccessPackageName  = $request.AccessPackageName
+            RequestorName      = $request.RequestorName
+            RequestJustification = $request.Justification
+            
+            AssignmentId       = $assignment.AssignmentId
+            AssignmentState    = $assignment.AssignmentState
+            AssignmentStart    = $assignment.AssignmentStart
+            AssignmentEnd      = $assignment.AssignmentEnd
+        }
+
+        # Add the merged item to the final array
+        $mergedData += $mergedItem
+    }
+}
+
+# Export the merged data to a new CSV file
+$mergedData | Export-Csv -Path "./MergedAssignmentData.csv" -NoTypeInformation
+Write-Host "Merged data has been exported to 'MergedAssignmentData.csv'" -BackgroundColor Green
